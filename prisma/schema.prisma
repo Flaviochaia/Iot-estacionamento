@@ -1,0 +1,73 @@
+// Modelo de dados - Smart Parking G3 (DSIo 2026)
+// Começa com SQLite (zero configuração). Para mudar de BD, altera só o bloco
+// "datasource" (ex.: provider = "sqlserver" e url = env("DATABASE_URL")).
+
+generator client {
+  provider             = "prisma-client-py"
+  interface            = "asyncio"
+  recursive_type_depth = 5
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model ParkingLot {
+  id         String   @id
+  name       String
+  totalSpots Int
+  gate       String   @default("CLOSED") // OPEN | CLOSED
+  mode       String   @default("AUTO")   // AUTO | MANUAL
+  lastSeenAt DateTime?                   // última mensagem recebida do ESP32
+  createdAt  DateTime @default(now())
+
+  spots     ParkingSpot[]
+  events    ParkingEvent[]
+  snapshots StatusSnapshot[]
+}
+
+model ParkingSpot {
+  id             Int      @id @default(autoincrement())
+  lotId          String
+  number         Int
+  state          String   @default("FREE") // FREE | OCCUPIED | FAULT
+  lastDistanceCm Float?
+  updatedAt      DateTime @updatedAt
+
+  lot ParkingLot @relation(fields: [lotId], references: [id])
+
+  @@unique([lotId, number])
+}
+
+// Histórico de ocorrências (entrada/saída, cancela, falhas, comandos)
+model ParkingEvent {
+  id         Int       @id @default(autoincrement())
+  lotId      String
+  spotNumber Int?
+  type       String
+  detail     String?
+  deviceTs   DateTime? // hora enviada pelo ESP32 (NTP), se disponível
+  createdAt  DateTime  @default(now())
+
+  lot ParkingLot @relation(fields: [lotId], references: [id])
+
+  @@index([lotId, createdAt])
+  @@index([type])
+}
+
+// Leituras agregadas para o gráfico de ocupação
+model StatusSnapshot {
+  id        Int      @id @default(autoincrement())
+  lotId     String
+  total     Int
+  free      Int
+  occupied  Int
+  gate      String
+  mode      String
+  createdAt DateTime @default(now())
+
+  lot ParkingLot @relation(fields: [lotId], references: [id])
+
+  @@index([lotId, createdAt])
+}

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Parking G3</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --ink: #1b1f24; --muted: #65707c; --line: #e2e6ea;
+    --free: #1a7f4b; --free-bg: #e4f4ea;
+    --occ: #b3261e; --occ-bg: #fbe7e5;
+    --fault: #8a5a00; --fault-bg: #fff1d6;
+    --accent: #2457c5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151a; --card: #1b2027; --ink: #e8ebef; --muted: #96a1ad; --line: #2a313a;
+      --free: #5fd394; --free-bg: #17301f;
+      --occ: #ff8a80; --occ-bg: #3a1c1a;
+      --fault: #f3c56b; --fault-bg: #38290c;
+      --accent: #7fa6ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
+           justify-content: space-between; padding: 16px 20px; }
+  h1 { font-size: 20px; margin: 0; }
+  h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); font-weight: 600;
+       text-transform: uppercase; letter-spacing: .04em; }
+  main { display: grid; gap: 16px; padding: 0 20px 28px; max-width: 1100px; margin: 0 auto;
+         grid-template-columns: repeat(12, 1fr); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .c12 { grid-column: span 12; } .c8 { grid-column: span 8; } .c4 { grid-column: span 4; }
+  .c6 { grid-column: span 6; } .c3 { grid-column: span 3; }
+  @media (max-width: 760px) { .c8, .c4, .c6, .c3 { grid-column: span 12; } main { padding: 0 16px 24px; } }
+
+  .pill { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px;
+          border-radius: 999px; font-size: 13px; border: 1px solid var(--line); background: var(--card); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .on .dot { background: var(--free); } .off .dot { background: var(--occ); }
+
+  .kpi { display: flex; flex-direction: column; gap: 2px; }
+  .kpi b { font-size: 34px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .kpi span { color: var(--muted); font-size: 13px; }
+
+  .spots { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
+  .spot { border-radius: 10px; padding: 14px; border: 1px solid transparent; text-align: center; }
+  .spot .n { font-size: 13px; color: var(--muted); }
+  .spot .s { font-size: 18px; font-weight: 700; margin: 4px 0; }
+  .spot .d { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .FREE { background: var(--free-bg); color: var(--free); border-color: var(--free); }
+  .OCCUPIED { background: var(--occ-bg); color: var(--occ); border-color: var(--occ); }
+  .FAULT { background: var(--fault-bg); color: var(--fault); border-color: var(--fault); }
+  .FREE .n, .OCCUPIED .n, .FAULT .n, .FREE .d, .OCCUPIED .d, .FAULT .d { color: inherit; opacity: .8; }
+
+  .btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; cursor: pointer;
+           border: 1px solid var(--line); background: var(--card); color: var(--ink); }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  td.t { white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .tag { padding: 2px 8px; border-radius: 6px; font-size: 12px; background: var(--bg); border: 1px solid var(--line); }
+  .scroll { max-height: 360px; overflow: auto; }
+
+  svg { width: 100%; height: 190px; display: block; }
+  .axis text { fill: var(--muted); font-size: 11px; }
+  .gridline { stroke: var(--line); stroke-width: 1; }
+  .line { fill: none; stroke: var(--accent); stroke-width: 2; }
+  .area { fill: var(--accent); opacity: .12; }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--ink);
+           color: var(--bg); padding: 8px 14px; border-radius: 8px; opacity: 0; transition: opacity .2s; }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Smart Parking &middot; Grupo 3</h1>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <span class="pill" id="conn"><span class="dot"></span><span id="connTxt">A ligar...</span></span>
+    <span class="pill" id="lastSeen">Ultima mensagem: &ndash;</span>
+  </div>
+</header>
+
+<main>
+  <section class="card c3 kpi"><span>Total de lugares</span><b id="kTotal">&ndash;</b></section>
+  <section class="card c3 kpi"><span>Ocupados</span><b id="kOcc" style="color:var(--occ)">&ndash;</b></section>
+  <section class="card c3 kpi"><span>Disponiveis</span><b id="kFree" style="color:var(--free)">&ndash;</b></section>
+  <section class="card c3 kpi"><span>Cancela / modo</span><b id="kGate" style="font-size:22px">&ndash;</b><span id="kMode"></span></section>
+
+  <section class="card c8">
+    <h2>Estado actual dos lugares</h2>
+    <div class="spots" id="spots"><div class="empty">Sem dados ainda. Inicia a simulacao no Wokwi.</div></div>
+  </section>
+
+  <section class="card c4">
+    <h2>Controlo da cancela</h2>
+    <div>Modo automatico segue as regras do ESP32. Em modo manual podes abrir ou fechar.</div>
+    <div class="btns">
+      <button class="primary" data-cmd="AUTO">Automatico</button>
+      <button data-cmd="OPEN">Abrir</button>
+      <button data-cmd="CLOSE">Fechar</button>
+    </div>
+  </section>
+
+  <section class="card c8">
+    <h2>Ocupacao ao longo do tempo <select id="range" aria-label="Intervalo">
+      <option value="1">1 h</option><option value="6" selected>6 h</option><option value="24">24 h</option>
+    </select></h2>
+    <svg id="chart" viewBox="0 0 600 190" role="img" aria-label="Lugares ocupados ao longo do tempo"></svg>
+  </section>
+
+  <section class="card c4">
+    <h2>Utilizacao (24 h)</h2>
+    <div class="kpi"><b id="sEntries">&ndash;</b><span>entradas registadas</span></div>
+    <div class="kpi" style="margin-top:10px"><b id="sStay">&ndash;</b><span>permanencia media</span></div>
+    <div id="sSpots" style="margin-top:10px;color:var(--muted);font-size:13px"></div>
+  </section>
+
+  <section class="card c12">
+    <h2>Ultimos eventos <select id="evType" aria-label="Filtrar por tipo">
+      <option value="">todos</option><option>VEHICLE_ENTER</option><option>VEHICLE_EXIT</option>
+      <option>GATE_OPEN</option><option>GATE_CLOSE</option><option>LOT_FULL</option>
+      <option>SENSOR_FAULT</option><option>COMMAND</option>
+    </select></h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>Data/hora (Maputo)</th><th>Evento</th><th>Lugar</th><th>Detalhe</th></tr></thead>
+        <tbody id="events"><tr><td colspan="4" class="empty">Sem eventos.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<div id="toast" role="status"></div>
+
+<script>
+const TZ = "Africa/Maputo";
+const LABEL = { FREE: "Livre", OCCUPIED: "Ocupado", FAULT: "Falha" };
+const EVT = {
+  VEHICLE_ENTER: "Entrada de veiculo", VEHICLE_EXIT: "Saida de veiculo", GATE_OPEN: "Cancela aberta",
+  GATE_CLOSE: "Cancela fechada", LOT_FULL: "Parque lotado", LOT_AVAILABLE: "Lugar disponivel",
+  SENSOR_FAULT: "Falha de sensor", SENSOR_RECOVERED: "Sensor recuperado", ONLINE: "Dispositivo ligado",
+  COMMAND: "Comando do dashboard"
+};
+const $ = id => document.getElementById(id);
+const fmt = iso => iso ? new Date(iso).toLocaleString("pt-PT", { timeZone: TZ, hour12: false,
+  day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "–";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+  return r.json();
+}
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2500); }
+
+async function loadOverview() {
+  try {
+    const o = await api("/api/overview");
+    $("kTotal").textContent = o.total;
+    $("kOcc").textContent = o.occupied;
+    $("kFree").textContent = o.free;
+    $("kGate").textContent = o.gate === "OPEN" ? "Aberta" : "Fechada";
+    $("kMode").textContent = o.mode === "AUTO" ? "Modo automatico" : "Modo manual";
+    $("conn").className = "pill " + (o.online ? "on" : "off");
+    $("connTxt").textContent = o.online ? "ESP32 online" : "ESP32 offline";
+    $("lastSeen").textContent = "Ultima mensagem: " + fmt(o.lastSeenAt);
+    $("spots").innerHTML = o.spots.length ? o.spots.map(s => `
+      <div class="spot ${s.state}">
+        <div class="n">Lugar ${s.number}</div>
+        <div class="s">${LABEL[s.state] || s.state}</div>
+        <div class="d">${s.distanceCm != null ? s.distanceCm.toFixed(0) + " cm" : "sem leitura"}</div>
+      </div>`).join("") : '<div class="empty">Sem dados ainda. Inicia a simulacao no Wokwi.</div>';
+  } catch (e) {
+    $("conn").className = "pill off"; $("connTxt").textContent = "Servidor indisponivel";
+  }
+}
+
+async function loadEvents() {
+  const type = $("evType").value;
+  const rows = await api("/api/events?limit=40" + (type ? "&type=" + type : ""));
+  $("events").innerHTML = rows.length ? rows.map(e => `
+    <tr><td class="t">${fmt(e.at)}</td><td><span class="tag">${esc(EVT[e.type] || e.type)}</span></td>
+    <td>${e.spotNumber ?? "–"}</td><td>${esc(e.detail)}</td></tr>`).join("")
+    : '<tr><td colspan="4" class="empty">Sem eventos.</td></tr>';
+}
+
+async function loadStats() {
+  const s = await api("/api/stats?hours=24");
+  $("sEntries").textContent = s.totalEntries;
+  $("sStay").textContent = s.avgStayMinutes != null ? s.avgStayMinutes + " min" : "–";
+  $("sSpots").textContent = s.entriesPerSpot.length
+    ? "Por lugar: " + s.entriesPerSpot.map(x => `L${x.spot}: ${x.entries}`).join(" · ") : "";
+}
+
+async function loadChart() {
+  const hours = +$("range").value;
+  const pts = await api("/api/history?hours=" + hours);
+  const svg = $("chart");
+  if (pts.length < 2) { svg.innerHTML = '<text x="300" y="100" text-anchor="middle" fill="currentColor" opacity=".5">Dados insuficientes</text>'; return; }
+  const W = 600, H = 190, L = 28, R = 8, T = 10, B = 24;
+  const total = Math.max(...pts.map(p => p.total), 1);
+  const t0 = new Date(pts[0].t).getTime(), t1 = Date.now();
+  const x = t => L + (t - t0) / Math.max(t1 - t0, 1) * (W - L - R);
+  const y = v => T + (1 - v / total) * (H - T - B);
+  // degrau: mantem o valor ate a proxima mudanca
+  let d = "";
+  pts.forEach((p, i) => { const px = x(new Date(p.t).getTime());
+    d += (i ? `H${px}V${y(p.occupied)}` : `M${px},${y(p.occupied)}`); });
+  d += `H${x(t1)}`;
+  let grid = "";
+  for (let v = 0; v <= total; v++) grid += `<line class="gridline" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${v}</text>`;
+  const tick = t => new Date(t).toLocaleTimeString("pt-PT", { timeZone: TZ, hour: "2-digit", minute: "2-digit" });
+  svg.innerHTML = `<g class="axis">${grid}<text x="${L}" y="${H - 6}">${tick(t0)}</text>
+    <text x="${W - R}" y="${H - 6}" text-anchor="end">${tick(t1)}</text></g>
+    <path class="area" d="${d}V${y(0)}H${x(pts[0].t ? new Date(pts[0].t).getTime() : t0)}Z"/>
+    <path class="line" d="${d}"/>`;
+}
+
+document.querySelectorAll("[data-cmd]").forEach(b => b.addEventListener("click", async () => {
+  try { await api("/api/gate", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command: b.dataset.cmd }) });
+        toast("Comando enviado: " + b.dataset.cmd); setTimeout(refresh, 1200); }
+  catch (e) { toast("Erro: " + e.message); }
+}));
+$("range").addEventListener("change", loadChart);
+$("evType").addEventListener("change", loadEvents);
+
+async function refresh() { await Promise.allSettled([loadOverview(), loadEvents(), loadStats(), loadChart()]); }
+refresh();
+setInterval(loadOverview, 3000);
+setInterval(() => { loadEvents(); loadStats(); loadChart(); }, 10000);
+</script>
+</body>
+</html>

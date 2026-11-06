@@ -1,0 +1,50 @@
+# Smart Parking G3 — Dashboard (HTML + Python + Prisma)
+
+```
+ESP32 (Wokwi) --MQTT--> backend FastAPI --Prisma--> BD (SQLite) --REST--> dashboard HTML
+                  ^                                                          |
+                  +------------------ comando AUTO/OPEN/CLOSE <--------------+
+```
+
+## Estrutura
+```
+prisma/schema.prisma   modelo de dados (ParkingLot, ParkingSpot, ParkingEvent, StatusSnapshot)
+app/main.py            API REST + subscritor MQTT
+static/index.html      dashboard (valores actuais, estado, grafico, historico, controlo)
+scripts/simulate.py    simulador do ESP32 (testar sem Wokwi)
+```
+
+## Arrancar
+Usa sempre `python -m ...` (funciona mesmo quando os scripts do pip nao estao no PATH,
+caso comum com o Python da Microsoft Store no Windows):
+```powershell
+pip install -r requirements.txt
+python -m prisma generate        # gera o cliente Python
+python -m prisma db push         # cria a BD SQLite (prisma/dev.db)
+python -m uvicorn app.main:app --reload
+```
+Opcional: ambiente virtual (`python -m venv .venv` e `.venv\Scripts\activate` no Windows,
+`source .venv/bin/activate` em Linux/macOS) antes do `pip install`.
+
+Abre http://127.0.0.1:8000
+
+Para testar sem o Wokwi, noutro terminal: `python scripts/simulate.py`
+
+## Wokwi + dashboard local
+O Wokwi publica no broker publico `broker.hivemq.com` e o backend subscreve o mesmo broker,
+por isso nao precisam de se ver directamente. Os topicos sao partilhados por toda a gente
+nesse broker: se houver colisao com outros grupos, muda o prefixo `ujac/dsio/g3/parking`
+no `sketch.ino` e em `MQTT_BASE` (variavel de ambiente).
+
+## Endpoints
+| Metodo | Rota | Descricao |
+|---|---|---|
+| GET | `/api/overview` | total, ocupados, livres, cancela, modo, online, lugares |
+| GET | `/api/events?limit=&type=` | historico de eventos |
+| GET | `/api/history?hours=` | evolucao da ocupacao |
+| GET | `/api/stats?hours=` | entradas por lugar e permanencia media |
+| POST | `/api/gate` | `{"command":"AUTO"\|"OPEN"\|"CLOSE"}` envia comando ao ESP32 |
+
+## Mudar para SQL Server / PostgreSQL
+Altera o bloco `datasource` em `prisma/schema.prisma` (`provider` e `url = env("DATABASE_URL")`),
+define `DATABASE_URL` e repete `prisma db push`.
