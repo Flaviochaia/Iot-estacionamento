@@ -3,3 +3,4 @@ prisma/dev.db
 prisma/dev.db-journal
 __pycache__/
 .venv/
+node_modules

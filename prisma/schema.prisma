@@ -25,6 +25,8 @@ model ParkingLot {
   spots     ParkingSpot[]
   events    ParkingEvent[]
   snapshots StatusSnapshot[]
+  sessions  ParkingSession[]
+  requests  VisitorRequest[]
 }
 
 model ParkingSpot {
@@ -47,10 +49,15 @@ model ParkingEvent {
   spotNumber Int?
   type       String
   detail     String?
+  driverId   Int?
+  vehicleId  Int?
+  accessMethod String? // RFID | VISITOR_APPROVAL | MANUAL | SENSOR
   deviceTs   DateTime? // hora enviada pelo ESP32 (NTP), se disponível
   createdAt  DateTime  @default(now())
 
-  lot ParkingLot @relation(fields: [lotId], references: [id])
+  lot     ParkingLot @relation(fields: [lotId], references: [id])
+  driver  Driver?    @relation(fields: [driverId], references: [id])
+  vehicle Vehicle?   @relation(fields: [vehicleId], references: [id])
 
   @@index([lotId, createdAt])
   @@index([type])
@@ -70,4 +77,106 @@ model StatusSnapshot {
   lot ParkingLot @relation(fields: [lotId], references: [id])
 
   @@index([lotId, createdAt])
+}
+
+
+// Pessoas autorizadas a utilizar o estacionamento. OWNER = proprietario.
+model Driver {
+  id        Int      @id @default(autoincrement())
+  fullName  String
+  biNumber  String?  @unique
+  phone     String?
+  role      String   @default("OWNER") // OWNER | VISITOR
+  status    String   @default("ACTIVE") // ACTIVE | BLOCKED
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  vehicles Vehicle[]
+  cards    AccessCard[]
+  sessions ParkingSession[]
+  requests VisitorRequest[]
+  events   ParkingEvent[]
+
+  @@index([fullName])
+  @@index([role, status])
+}
+
+// Veiculos associados aos motoristas.
+model Vehicle {
+  id        Int      @id @default(autoincrement())
+  driverId  Int
+  plate     String   @unique
+  brand     String?
+  model     String?
+  color     String?
+  createdAt DateTime @default(now())
+
+  driver   Driver           @relation(fields: [driverId], references: [id])
+  sessions ParkingSession[]
+  events   ParkingEvent[]
+
+  @@index([driverId])
+}
+
+// Cartao RFID atribuido a um proprietario. Guardar o UID normalizado em maiusculas.
+model AccessCard {
+  id        Int      @id @default(autoincrement())
+  driverId  Int
+  uid       String   @unique
+  status    String   @default("ACTIVE") // ACTIVE | BLOCKED
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  driver Driver @relation(fields: [driverId], references: [id])
+
+  @@index([driverId, status])
+}
+
+// Pedido criado quando o sensor de entrada detecta um visitante.
+// A rececao completa os dados e decide autorizar ou recusar.
+model VisitorRequest {
+  id            Int       @id @default(autoincrement())
+  lotId         String
+  driverId      Int?
+  visitorName   String?
+  biNumber      String?
+  phone         String?
+  plate         String?
+  vehicleBrand  String?
+  vehicleModel  String?
+  status        String    @default("PENDING") // PENDING | APPROVED | REJECTED | ENTERED | EXITED | CANCELLED
+  requestedAt   DateTime  @default(now())
+  decidedAt     DateTime?
+  decidedBy     String?
+  notes         String?
+
+  lot    ParkingLot @relation(fields: [lotId], references: [id])
+  driver Driver?    @relation(fields: [driverId], references: [id])
+  session ParkingSession?
+
+  @@index([lotId, status, requestedAt])
+  @@index([plate])
+}
+
+// Cada permanencia no parque: entrada e saida do mesmo veiculo.
+model ParkingSession {
+  id           Int       @id @default(autoincrement())
+  lotId        String
+  driverId     Int
+  vehicleId    Int
+  spotNumber   Int?
+  accessMethod String    // RFID | VISITOR_APPROVAL | MANUAL
+  entryAt      DateTime  @default(now())
+  exitAt       DateTime?
+  status       String    @default("ACTIVE") // ACTIVE | CLOSED | CANCELLED
+  visitorRequestId Int?  @unique
+
+  lot            ParkingLot      @relation(fields: [lotId], references: [id])
+  driver         Driver          @relation(fields: [driverId], references: [id])
+  vehicle        Vehicle         @relation(fields: [vehicleId], references: [id])
+  visitorRequest VisitorRequest? @relation(fields: [visitorRequestId], references: [id])
+
+  @@index([lotId, status])
+  @@index([driverId, entryAt])
+  @@index([vehicleId, entryAt])
 }

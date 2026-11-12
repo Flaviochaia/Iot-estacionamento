@@ -263,9 +263,59 @@ async def stats(lotId: str = LOT_ID, hours: int = Query(24, ge=1, le=168)):
     }
 
 
+
 class GateCommand(BaseModel):
     command: str   # AUTO | OPEN | CLOSE
 
+class DriverCreate(BaseModel):
+    fullName: str
+    biNumber: str | None = None
+    phone: str | None = None
+
+
+class DriverStatusUpdate(BaseModel):
+    status: str
+    
+
+class VehicleCreate(BaseModel):
+    driverId: int
+    plate: str
+    brand: str | None = None
+    model: str | None = None
+    color: str | None = None
+
+class CardCreate(BaseModel):
+    driverId: int
+    uid: str
+
+
+class CardStatusUpdate(BaseModel):
+    status: str    
+
+class RFIDScan(BaseModel):
+    uid: str
+    plate: str
+
+class VisitorRequestCreate(BaseModel):
+    visitorName: str | None = None
+    biNumber: str | None = None
+    phone: str | None = None
+    plate: str | None = None
+    vehicleBrand: str | None = None
+    vehicleModel: str | None = None
+    notes: str | None = None
+
+
+class VisitorDecision(BaseModel):
+    decidedBy: str = "Recepcao"
+    notes: str | None = None
+    visitorName: str | None = None
+    biNumber: str | None = None
+    phone: str | None = None
+    plate: str | None = None
+    vehicleBrand: str | None = None
+    vehicleModel: str | None = None
+    notes: str | None = None
 
 @app.post("/api/gate")
 async def gate_command(body: GateCommand, lotId: str = LOT_ID):
@@ -280,13 +330,712 @@ async def gate_command(body: GateCommand, lotId: str = LOT_ID):
         "lotId": lotId, "type": "COMMAND", "detail": f"dashboard -> {cmd}"})
     return {"sent": cmd}
 
+# --------------------------------------------------------------------------
+# VALIDACAO RFID
+# --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# GESTAO DE VISITANTES
+# --------------------------------------------------------------------------
+
+@app.post("/api/visitors", status_code=201)
+async def create_visitor_request(body: VisitorRequestCreate):
+
+    await ensure_lot(LOT_ID, 4)
+
+    request = await db.visitorrequest.create(
+        data={
+            "lotId": LOT_ID,
+            "visitorName": body.visitorName.strip() if body.visitorName else None,
+            "biNumber": body.biNumber.strip() if body.biNumber else None,
+            "phone": body.phone.strip() if body.phone else None,
+            "plate": body.plate.strip().upper() if body.plate else None,
+            "vehicleBrand": body.vehicleBrand,
+            "vehicleModel": body.vehicleModel,
+            "notes": body.notes,
+            "status": "PENDING"
+        }
+    )
+
+    return {
+        "message": "Pedido de visita criado com sucesso",
+        "request": {
+            "id": request.id,
+            "visitorName": request.visitorName,
+            "plate": request.plate,
+            "status": request.status,
+            "requestedAt": iso(request.requestedAt)
+        }
+    }
+
+
+@app.get("/api/visitors")
+async def list_visitor_requests(status: str | None = None):
+
+    where = {"lotId": LOT_ID}
+
+    if status:
+        status = status.upper()
+
+        if status not in (
+            "PENDING", "APPROVED", "REJECTED",
+            "ENTERED", "EXITED", "CANCELLED"
+        ):
+            raise HTTPException(400, "Estado de pedido invalido")
+
+        where["status"] = status
+
+    requests = await db.visitorrequest.find_many(
+        where=where,
+        order={"requestedAt": "desc"}
+    )
+
+    return [
+        {
+            "id": r.id,
+            "visitorName": r.visitorName,
+            "biNumber": r.biNumber,
+            "phone": r.phone,
+            "plate": r.plate,
+            "vehicleBrand": r.vehicleBrand,
+            "vehicleModel": r.vehicleModel,
+            "status": r.status,
+            "requestedAt": iso(r.requestedAt),
+            "decidedAt": iso(r.decidedAt),
+            "decidedBy": r.decidedBy,
+            "notes": r.notes
+        }
+        for r in requests
+    ]
+@app.patch("/api/visitors/{request_id}/approve")
+async def approve_visitor(
+    request_id: int,
+    body: VisitorDecision
+):
+    # 1. Procurar pedido
+    request = await db.visitorrequest.find_unique(
+        where={"id": request_id}
+    )
+
+    if not request:
+        raise HTTPException(404, "Pedido de visita nao encontrado")
+
+    if request.status != "PENDING":
+        raise HTTPException(400, "Este pedido ja foi decidido")
+
+    # 2. Validar dados obrigatorios
+    if not request.visitorName or not request.plate:
+        raise HTTPException(
+            400,
+            "O nome do visitante e a matricula sao obrigatorios"
+        )
+
+    # 3. Verificar ligacao MQTT
+    if not mqtt_client or not mqtt_client.is_connected():
+        raise HTTPException(503, "Sem ligacao ao ESP32/MQTT")
+
+    # 4. Verificar vagas livres
+    free_spots = await db.parkingspot.find_many(
+        where={
+            "lotId": request.lotId,
+            "state": "FREE"
+        },
+        take=1
+    )
+
+    if not free_spots:
+        raise HTTPException(
+            403,
+            "Parque cheio ou sem vagas disponiveis"
+        )
+
+    # 5. Procurar visitante pelo BI, se existir
+    driver = None
+
+    if request.biNumber:
+        driver = await db.driver.find_unique(
+            where={"biNumber": request.biNumber}
+        )
+
+        if driver and driver.role != "VISITOR":
+            raise HTTPException(
+                409,
+                "Este BI ja esta associado a um proprietario"
+            )
+
+    # 6. Criar visitante se ainda nao estiver registado
+    if not driver:
+        driver = await db.driver.create(
+            data={
+                "fullName": request.visitorName.strip(),
+                "biNumber": request.biNumber,
+                "phone": request.phone,
+                "role": "VISITOR",
+                "status": "ACTIVE"
+            }
+        )
+
+    if driver.status != "ACTIVE":
+        raise HTTPException(403, "Visitante bloqueado")
+
+    # 7. Verificar matricula
+    plate = request.plate.strip().upper()
+
+    vehicle = await db.vehicle.find_unique(
+        where={"plate": plate}
+    )
+
+    if vehicle:
+        if vehicle.driverId != driver.id:
+            raise HTTPException(
+                409,
+                "Esta matricula ja pertence a outro condutor"
+            )
+    else:
+        vehicle = await db.vehicle.create(
+            data={
+                "driverId": driver.id,
+                "plate": plate,
+                "brand": request.vehicleBrand,
+                "model": request.vehicleModel
+            }
+        )
+
+    # 8. Atualizar pedido
+    updated = await db.visitorrequest.update(
+        where={"id": request_id},
+        data={
+            "driverId": driver.id,
+            "status": "APPROVED",
+            "decidedAt": utcnow(),
+            "decidedBy": body.decidedBy,
+            "notes": body.notes or request.notes
+        }
+    )
+
+    # 9. Registar evento
+    await db.parkingevent.create(
+        data={
+            "lotId": request.lotId,
+            "type": "VISITOR_APPROVED",
+            "detail": f"Visita aprovada: {plate}",
+            "driverId": driver.id,
+            "vehicleId": vehicle.id,
+            "accessMethod": "VISITOR_APPROVAL"
+        }
+    )
+
+    # 10. Abrir cancela
+    mqtt_client.publish(
+        f"{BASE}/cmd",
+        "OPEN",
+        qos=1
+    )
+
+    return {
+        "authorized": True,
+        "message": "Visita aprovada com sucesso",
+        "requestId": updated.id,
+        "visitor": driver.fullName,
+        "plate": vehicle.plate,
+        "status": updated.status,
+        "gate": "OPEN"
+    }
+@app.patch("/api/visitors/{request_id}/reject")
+async def reject_visitor(
+    request_id: int,
+    body: VisitorDecision
+):
+    request = await db.visitorrequest.find_unique(
+        where={"id": request_id}
+    )
+
+    if not request:
+        raise HTTPException(404, "Pedido de visita nao encontrado")
+
+    if request.status != "PENDING":
+        raise HTTPException(400, "Este pedido ja foi decidido")
+
+    updated = await db.visitorrequest.update(
+        where={"id": request_id},
+        data={
+            "status": "REJECTED",
+            "decidedAt": utcnow(),
+            "decidedBy": body.decidedBy,
+            "notes": body.notes or request.notes
+        }
+    )
+
+    await db.parkingevent.create(
+        data={
+            "lotId": request.lotId,
+            "type": "VISITOR_REJECTED",
+            "detail": f"Visita rejeitada: {request.plate or request.visitorName}",
+            "accessMethod": "VISITOR_APPROVAL"
+        }
+    )
+
+    return {
+        "message": "Pedido de visita rejeitado",
+        "requestId": updated.id,
+        "status": updated.status
+    }
+# --------------------------------------------------------------------------
+# GESTAO DE PROPRIETARIOS
+# --------------------------------------------------------------------------
+
+@app.post("/api/drivers", status_code=201)
+async def create_driver(body: DriverCreate):
+
+    name = body.fullName.strip()
+
+    if not name:
+        raise HTTPException(400, "O nome e obrigatorio")
+
+    bi = body.biNumber.strip() if body.biNumber else None
+    phone = body.phone.strip() if body.phone else None
+
+    # Verificar BI duplicado
+    if bi:
+        existing = await db.driver.find_unique(
+            where={"biNumber": bi}
+        )
+
+        if existing:
+            raise HTTPException(409, "Este BI ja esta registado")
+
+    driver = await db.driver.create(
+        data={
+            "fullName": name,
+            "biNumber": bi,
+            "phone": phone,
+            "role": "OWNER",
+            "status": "ACTIVE"
+        }
+    )
+
+    return {
+        "message": "Proprietario registado com sucesso",
+        "driver": {
+            "id": driver.id,
+            "fullName": driver.fullName,
+            "biNumber": driver.biNumber,
+            "phone": driver.phone,
+            "role": driver.role,
+            "status": driver.status
+        }
+    }
+
+
+@app.get("/api/drivers")
+async def list_drivers():
+
+    drivers = await db.driver.find_many(
+        where={"role": "OWNER"},
+        order={"fullName": "asc"}
+    )
+
+    return [
+        {
+            "id": d.id,
+            "fullName": d.fullName,
+            "biNumber": d.biNumber,
+            "phone": d.phone,
+            "role": d.role,
+            "status": d.status,
+            "createdAt": iso(d.createdAt)
+        }
+        for d in drivers
+    ]
+
+
+@app.patch("/api/drivers/{driver_id}/status")
+async def update_driver_status(
+    driver_id: int,
+    body: DriverStatusUpdate
+):
+
+    status = body.status.upper()
+
+    if status not in ("ACTIVE", "BLOCKED"):
+        raise HTTPException(
+            400,
+            "Estado invalido. Utilize ACTIVE ou BLOCKED"
+        )
+
+    driver = await db.driver.find_unique(
+        where={"id": driver_id}
+    )
+
+    if not driver:
+        raise HTTPException(404, "Proprietario nao encontrado")
+
+    updated = await db.driver.update(
+        where={"id": driver_id},
+        data={"status": status}
+    )
+
+    return {
+        "message": "Estado atualizado com sucesso",
+        "id": updated.id,
+        "status": updated.status
+    }
+    
+@app.post("/api/vehicles", status_code=201)
+async def create_vehicle(body: VehicleCreate):
+
+    plate = body.plate.strip().upper()
+
+    if not plate:
+        raise HTTPException(400, "A matricula e obrigatoria")
+
+    driver = await db.driver.find_unique(
+        where={"id": body.driverId}
+    )
+
+    if not driver:
+        raise HTTPException(404, "Proprietario nao encontrado")
+
+    if driver.role != "OWNER":
+        raise HTTPException(400, "O condutor nao e proprietario")
+
+    if driver.status != "ACTIVE":
+        raise HTTPException(400, "Proprietario bloqueado")
+
+    existing = await db.vehicle.find_unique(
+        where={"plate": plate}
+    )
+
+    if existing:
+        raise HTTPException(409, "Esta matricula ja esta registada")
+
+    vehicle = await db.vehicle.create(
+        data={
+            "driverId": body.driverId,
+            "plate": plate,
+            "brand": body.brand,
+            "model": body.model,
+            "color": body.color
+        }
+    )
+
+    return {
+        "message": "Veiculo registado com sucesso",
+        "vehicle": {
+            "id": vehicle.id,
+            "driverId": vehicle.driverId,
+            "plate": vehicle.plate,
+            "brand": vehicle.brand,
+            "model": vehicle.model,
+            "color": vehicle.color
+        }
+    }
+#consulta de veiculos 
+@app.get("/api/vehicles")
+async def list_vehicles():
+    vehicles = await db.vehicle.find_many(
+        include={"driver": True},
+        order={"plate": "asc"}
+    )
+
+    return [
+        {
+            "id": v.id,
+            "plate": v.plate,
+            "brand": v.brand,
+            "model": v.model,
+            "color": v.color,
+            "driver": {
+                "id": v.driver.id,
+                "fullName": v.driver.fullName,
+                "biNumber": v.driver.biNumber
+            }
+        }
+        for v in vehicles
+    ]        
+
+@app.post("/api/cards", status_code=201)
+async def create_card(body: CardCreate):
+
+    uid = body.uid.strip().upper()
+
+    if not uid:
+        raise HTTPException(400, "UID do cartao obrigatorio")
+
+    driver = await db.driver.find_unique(
+        where={"id": body.driverId}
+    )
+
+    if not driver:
+        raise HTTPException(404, "Proprietario nao encontrado")
+
+    if driver.role != "OWNER":
+        raise HTTPException(400, "O condutor nao e proprietario")
+
+    if driver.status != "ACTIVE":
+        raise HTTPException(400, "Proprietario bloqueado")
+
+    existing = await db.accesscard.find_unique(
+        where={"uid": uid}
+    )
+
+    if existing:
+        raise HTTPException(409, "Este cartao ja esta registado")
+
+    card = await db.accesscard.create(
+        data={
+            "driverId": body.driverId,
+            "uid": uid,
+            "status": "ACTIVE"
+        }
+    )
+
+    return {
+        "message": "Cartao RFID registado com sucesso",
+        "card": {
+            "id": card.id,
+            "driverId": card.driverId,
+            "uid": card.uid,
+            "status": card.status
+        }
+    }
+
+
+@app.get("/api/cards")
+async def list_cards():
+
+    cards = await db.accesscard.find_many(
+        include={"driver": True},
+        order={"createdAt": "desc"}
+    )
+
+    return [
+        {
+            "id": c.id,
+            "uid": c.uid,
+            "status": c.status,
+            "createdAt": iso(c.createdAt),
+            "driver": {
+                "id": c.driver.id,
+                "fullName": c.driver.fullName,
+                "biNumber": c.driver.biNumber,
+                "phone": c.driver.phone,
+                "role": c.driver.role
+            }
+        }
+        for c in cards
+    ]
+
+@app.patch("/api/cards/{card_id}/status")
+async def update_card_status(
+    card_id: int,
+    body: CardStatusUpdate
+):
+
+    status = body.status.upper()
+
+    if status not in ("ACTIVE", "BLOCKED"):
+        raise HTTPException(
+            400,
+            "Estado invalido. Utilize ACTIVE ou BLOCKED"
+        )
+
+    card = await db.accesscard.find_unique(
+        where={"id": card_id}
+    )
+
+    if not card:
+        raise HTTPException(404, "Cartao nao encontrado")
+
+    updated = await db.accesscard.update(
+        where={"id": card_id},
+        data={"status": status}
+    )
+
+    return {
+        "message": "Estado do cartao atualizado",
+        "id": updated.id,
+        "status": updated.status
+    }
+
+
+# --------------------------------------------------------------------------
+# VALIDACAO RFID
+# --------------------------------------------------------------------------
+
+@app.post("/api/rfid/scan")
+async def rfid_scan(body: RFIDScan):
+
+    uid = body.uid.strip().upper().replace(":", "").replace(" ", "")
+    plate = body.plate.strip().upper()
+
+    if not uid or not plate:
+        raise HTTPException(
+            400,
+            "UID e matricula sao obrigatorios"
+        )
+
+    # 1. Procurar o cartao
+    card = await db.accesscard.find_unique(
+        where={"uid": uid},
+        include={"driver": True}
+    )
+
+    if not card:
+        raise HTTPException(403, "Cartao RFID desconhecido")
+
+    # 2. Verificar estado do cartao
+    if card.status != "ACTIVE":
+        raise HTTPException(403, "Cartao RFID bloqueado")
+
+    driver = card.driver
+
+    # 3. Verificar proprietario
+    if driver.status != "ACTIVE":
+        raise HTTPException(403, "Proprietario bloqueado")
+
+    if driver.role != "OWNER":
+        raise HTTPException(403, "Acesso nao autorizado")
+
+    # 4. Procurar veiculo
+    vehicle = await db.vehicle.find_unique(
+        where={"plate": plate}
+    )
+
+    if not vehicle:
+        raise HTTPException(404, "Veiculo nao registado")
+
+    if vehicle.driverId != driver.id:
+        raise HTTPException(
+            403,
+            "Este veiculo nao pertence ao proprietario do cartao"
+        )
+
+    # 5. Verificar ligacao MQTT
+    if not mqtt_client or not mqtt_client.is_connected():
+        raise HTTPException(
+            503,
+            "Sem ligacao ao ESP32/MQTT"
+        )
+
+    # 6. Verificar se o veiculo ja esta dentro
+    sessions = await db.parkingsession.find_many(
+        where={
+            "lotId": LOT_ID,
+            "driverId": driver.id,
+            "vehicleId": vehicle.id,
+            "status": "ACTIVE"
+        },
+        take=1
+    )
+
+    # ------------------------------------------------
+    # SAIDA DO VEICULO
+    # ------------------------------------------------
+
+    if sessions:
+
+        session = sessions[0]
+
+        await db.parkingsession.update(
+            where={"id": session.id},
+            data={
+                "exitAt": utcnow(),
+                "status": "CLOSED"
+            }
+        )
+
+        mqtt_client.publish(
+            f"{BASE}/cmd",
+            "OPEN",
+            qos=1
+        )
+
+        await db.parkingevent.create(
+            data={
+                "lotId": LOT_ID,
+                "type": "RFID_EXIT",
+                "detail": f"Saida autorizada: {plate}",
+                "driverId": driver.id,
+                "vehicleId": vehicle.id,
+                "accessMethod": "RFID"
+            }
+        )
+
+        return {
+            "authorized": True,
+            "action": "EXIT",
+            "message": "Saida autorizada",
+            "driver": driver.fullName,
+            "plate": vehicle.plate,
+            "gate": "OPEN"
+        }
+
+    # ------------------------------------------------
+    # ENTRADA DO VEICULO
+    # ------------------------------------------------
+
+    # Verificar vagas livres
+    free_spots = await db.parkingspot.find_many(
+        where={
+            "lotId": LOT_ID,
+            "state": "FREE"
+        },
+        take=1
+    )
+
+    if not free_spots:
+        raise HTTPException(
+            403,
+            "Parque cheio ou estado das vagas indisponivel"
+        )
+
+    # Criar sessao de estacionamento
+    session = await db.parkingsession.create(
+        data={
+            "lotId": LOT_ID,
+            "driverId": driver.id,
+            "vehicleId": vehicle.id,
+            "accessMethod": "RFID",
+            "entryAt": utcnow(),
+            "status": "ACTIVE"
+        }
+    )
+
+    # Abrir cancela
+    mqtt_client.publish(
+        f"{BASE}/cmd",
+        "OPEN",
+        qos=1
+    )
+
+    await db.parkingevent.create(
+        data={
+            "lotId": LOT_ID,
+            "type": "RFID_ENTRY",
+            "detail": f"Entrada autorizada: {plate}",
+            "driverId": driver.id,
+            "vehicleId": vehicle.id,
+            "accessMethod": "RFID"
+        }
+    )
+
+    return {
+        "authorized": True,
+        "action": "ENTRY",
+        "message": "Entrada autorizada",
+        "driver": driver.fullName,
+        "plate": vehicle.plate,
+        "gate": "OPEN"
+    }
 # --------------------------------------------------------------------------
 # Dashboard estatico
 # --------------------------------------------------------------------------
 @app.get("/")
 async def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
