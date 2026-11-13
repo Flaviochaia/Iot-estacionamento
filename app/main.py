@@ -271,7 +271,6 @@ app = FastAPI(
     title="Smart Parking G3",
     lifespan=lifespan
 )
-
 @app.get("/api/overview")
 async def overview(lotId: str = LOT_ID):
     lot = await db.parkinglot.find_unique(
@@ -281,9 +280,16 @@ async def overview(lotId: str = LOT_ID):
         raise HTTPException(404, "Parque nao encontrado")
 
     spots = lot.spots or []
-    occupied = sum(1 for s in spots if s.state == "OCCUPIED")
+    sensor_occupied = sum(1 for s in spots if s.state == "OCCUPIED")
     fault = sum(1 for s in spots if s.state == "FAULT")
-    free = sum(1 for s in spots if s.state == "FREE")
+    active_sessions = await db.parkingsession.count(
+        where={"lotId": lotId, "status": "ACTIVE"}
+    )
+
+    # o maior entre o que os sensores vêem e as sessões abertas por cartão
+    occupied = max(sensor_occupied, active_sessions)
+    free = max(lot.totalSpots - fault - occupied, 0)
+
     online = bool(lot.lastSeenAt and (utcnow() - lot.lastSeenAt).total_seconds() <= ONLINE_WINDOW_S)
 
     return {
@@ -293,6 +299,7 @@ async def overview(lotId: str = LOT_ID):
         "occupied": occupied,
         "free": free,
         "fault": fault,
+        "activeSessions": active_sessions,
         "gate": lot.gate,
         "mode": lot.mode,
         "online": online,
@@ -301,8 +308,6 @@ async def overview(lotId: str = LOT_ID):
                    "distanceCm": s.lastDistanceCm, "updatedAt": iso(s.updatedAt)}
                   for s in spots],
     }
-
-
 @app.get("/api/events")
 async def events(lotId: str = LOT_ID, limit: int = Query(30, ge=1, le=200), type: str | None = None):
     where = {"lotId": lotId}
@@ -1093,20 +1098,20 @@ async def rfid_scan(body: RFIDScan):
 
     vehicle = vehicles[0]
 
-    # 8. Verificar vagas livres
-    free_spots = await db.parkingspot.find_many(
-        where={
-            "lotId": LOT_ID,
-            "state": "FREE"
-        },
-        take=1
+       # 8. Verificar vagas livres (sensores + sessoes activas)
+    sensor_occupied = await db.parkingspot.count(
+        where={"lotId": LOT_ID, "state": "OCCUPIED"}
     )
+    fault = await db.parkingspot.count(
+        where={"lotId": LOT_ID, "state": "FAULT"}
+    )
+    active = await db.parkingsession.count(
+        where={"lotId": LOT_ID, "status": "ACTIVE"}
+    )
+    lot = await db.parkinglot.find_unique(where={"id": LOT_ID})
 
-    if not free_spots:
-        raise HTTPException(
-            403,
-            "Parque cheio ou estado das vagas indisponivel"
-        )
+    if not lot or lot.totalSpots - fault - max(sensor_occupied, active) <= 0:
+        raise HTTPException(403, "Parque cheio")
 
     # 9. Criar sessao
     session = await db.parkingsession.create(
