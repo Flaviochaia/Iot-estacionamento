@@ -1,13 +1,4 @@
-"""
-Smart Parking G3 - Backend/API (FastAPI + Prisma + MQTT)
 
-ESP32 --MQTT--> este servico --Prisma--> BD --REST--> dashboard (HTML)
-
-Topicos:
-  <BASE>/status  (ESP32 -> servidor)  estado completo a cada 10 s
-  <BASE>/event   (ESP32 -> servidor)  eventos pontuais
-  <BASE>/cmd     (servidor -> ESP32)  AUTO | OPEN | CLOSE
-"""
 import asyncio
 import json
 import os
@@ -108,79 +99,179 @@ async def handle_event(data: dict):
     ts = data.get("ts") or 0
     device_ts = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else None
     spot = data.get("spotId")
+    etype = str(data.get("type", "UNKNOWN"))
 
+    # 1. Registar evento recebido
     await db.parkingevent.create(data={
         "lotId": lot_id,
         "spotNumber": int(spot) if spot else None,
-        "type": str(data.get("type", "UNKNOWN")),
+        "type": etype,
         "detail": data.get("detail"),
         "deviceTs": device_ts,
     })
-    await db.parkinglot.update(where={"id": lot_id}, data={"lastSeenAt": utcnow()})
 
-    # Actualiza o lugar de imediato (o proximo status confirma)
-    etype = data.get("type")
-    if spot and etype in ("VEHICLE_ENTER", "VEHICLE_EXIT", "SENSOR_FAULT", "SENSOR_RECOVERED"):
-        state = {"VEHICLE_ENTER": "OCCUPIED", "VEHICLE_EXIT": "FREE",
-                 "SENSOR_FAULT": "FAULT", "SENSOR_RECOVERED": "FREE"}[etype]
+    await db.parkinglot.update(
+        where={"id": lot_id},
+        data={"lastSeenAt": utcnow()}
+    )
+
+    # 2. Atualizar estado da vaga
+    if spot and etype in (
+        "VEHICLE_ENTER",
+        "VEHICLE_EXIT",
+        "SENSOR_FAULT",
+        "SENSOR_RECOVERED"
+    ):
+        state = {
+            "VEHICLE_ENTER": "OCCUPIED",
+            "VEHICLE_EXIT": "FREE",
+            "SENSOR_FAULT": "FAULT",
+            "SENSOR_RECOVERED": "FREE"
+        }[etype]
+
         await db.parkingspot.upsert(
-            where={"lotId_number": {"lotId": lot_id, "number": int(spot)}},
-            data={"create": {"lotId": lot_id, "number": int(spot), "state": state},
-                  "update": {"state": state}},
+            where={
+                "lotId_number": {
+                    "lotId": lot_id,
+                    "number": int(spot)
+                }
+            },
+            data={
+                "create": {
+                    "lotId": lot_id,
+                    "number": int(spot),
+                    "state": state
+                },
+                "update": {
+                    "state": state
+                }
+            }
         )
 
+    # 3. Processar leitura RFID
+    if etype == "RFID_SCAN":
+
+        uid = str(data.get("detail") or "").strip()
+
+        if not uid:
+            print("[RFID] ERRO: UID vazio")
+            return
+
+        print(f"[RFID] Pedido de autorizacao recebido: {uid}")
+
+        try:
+            result = await rfid_scan(
+                RFIDScan(uid=uid)
+            )
+
+            print(
+                f"[RFID] {result['action']} AUTORIZADA | "
+                f"Proprietario: {result['driver']} | "
+                f"Matricula: {result['plate']}"
+            )
+
+        except HTTPException as exc:
+            print(
+                f"[RFID] ACESSO RECUSADO | "
+                f"UID: {uid} | "
+                f"Motivo: {exc.detail}"
+            )
+
+        except Exception as exc:
+            print(f"[RFID] ERRO NA AUTORIZACAO: {exc!r}")
+# --------------------------------------------------------------------------
+# API REST
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# DISPATCH E INTEGRACAO MQTT
+# --------------------------------------------------------------------------
 
 async def dispatch(topic: str, payload: bytes):
     try:
         data = json.loads(payload.decode("utf-8"))
+
         if not isinstance(data, dict):
             raise ValueError("payload nao e um objecto JSON")
+
         if topic.endswith("/status"):
             await handle_status(data)
+
         elif topic.endswith("/event"):
             await handle_event(data)
-    except Exception as exc:  # mensagem invalida nunca derruba o servico
+
+    except Exception as exc:
         print(f"[MQTT] mensagem ignorada em {topic}: {exc!r}")
 
 
 def start_mqtt(loop: asyncio.AbstractEventLoop):
     global mqtt_client
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
-                         client_id=f"parking-backend-{uuid.uuid4().hex[:8]}")
+
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,
+        client_id=f"parking-backend-{uuid.uuid4().hex[:8]}"
+    )
 
     def on_connect(c, userdata, flags, reason_code, properties):
         print(f"[MQTT] ligado a {MQTT_HOST}:{MQTT_PORT} ({reason_code})")
-        c.subscribe([(f"{BASE}/status", 0), (f"{BASE}/event", 1)])
+
+        c.subscribe([
+            (f"{BASE}/status", 0),
+            (f"{BASE}/event", 1)
+        ])
 
     def on_message(c, userdata, msg):
-        asyncio.run_coroutine_threadsafe(dispatch(msg.topic, msg.payload), loop)
+        asyncio.run_coroutine_threadsafe(
+            dispatch(msg.topic, msg.payload),
+            loop
+        )
 
     client.on_connect = on_connect
     client.on_message = on_message
-    client.reconnect_delay_set(min_delay=1, max_delay=30)   # reconexao automatica
-    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
+
+    client.reconnect_delay_set(
+        min_delay=1,
+        max_delay=30
+    )
+
+    client.connect_async(
+        MQTT_HOST,
+        MQTT_PORT,
+        keepalive=30
+    )
+
     client.loop_start()
     mqtt_client = client
 
 
+# --------------------------------------------------------------------------
+# INICIALIZACAO FASTAPI
+# --------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     await db.connect()
     await ensure_lot(LOT_ID, 4)
+
     start_mqtt(asyncio.get_running_loop())
+
+    print("[BACKEND] Smart Parking G3 iniciado")
+
     yield
+
     if mqtt_client:
         mqtt_client.loop_stop()
         mqtt_client.disconnect()
+
     await db.disconnect()
 
 
-app = FastAPI(title="Smart Parking G3", lifespan=lifespan)
+app = FastAPI(
+    title="Smart Parking G3",
+    lifespan=lifespan
+)
 
-
-# --------------------------------------------------------------------------
-# API REST
-# --------------------------------------------------------------------------
 @app.get("/api/overview")
 async def overview(lotId: str = LOT_ID):
     lot = await db.parkinglot.find_unique(
@@ -294,7 +385,7 @@ class CardStatusUpdate(BaseModel):
 
 class RFIDScan(BaseModel):
     uid: str
-    plate: str
+
 
 class VisitorRequestCreate(BaseModel):
     visitorName: str | None = None
@@ -315,7 +406,7 @@ class VisitorDecision(BaseModel):
     plate: str | None = None
     vehicleBrand: str | None = None
     vehicleModel: str | None = None
-    notes: str | None = None
+   
 
 @app.post("/api/gate")
 async def gate_command(body: GateCommand, lotId: str = LOT_ID):
@@ -757,7 +848,8 @@ async def list_vehicles():
 @app.post("/api/cards", status_code=201)
 async def create_card(body: CardCreate):
 
-    uid = body.uid.strip().upper()
+    # Normalizar UID: remover dois-pontos e espaços
+    uid = body.uid.strip().upper().replace(":", "").replace(" ", "")
 
     if not uid:
         raise HTTPException(400, "UID do cartao obrigatorio")
@@ -799,7 +891,6 @@ async def create_card(body: CardCreate):
             "status": card.status
         }
     }
-
 
 @app.get("/api/cards")
 async def list_cards():
@@ -862,80 +953,86 @@ async def update_card_status(
 # --------------------------------------------------------------------------
 # VALIDACAO RFID
 # --------------------------------------------------------------------------
-
 @app.post("/api/rfid/scan")
 async def rfid_scan(body: RFIDScan):
 
+    # 1. Normalizar UID
     uid = body.uid.strip().upper().replace(":", "").replace(" ", "")
-    plate = body.plate.strip().upper()
 
-    if not uid or not plate:
-        raise HTTPException(
-            400,
-            "UID e matricula sao obrigatorios"
-        )
+    if not uid:
+        raise HTTPException(400, "UID do cartao obrigatorio")
 
-    # 1. Procurar o cartao
+    # 2. Procurar cartao no formato normalizado
     card = await db.accesscard.find_unique(
         where={"uid": uid},
         include={"driver": True}
     )
 
+    # 3. Compatibilidade com cartoes antigos
+    if not card:
+        pretty_uid = ":".join(
+            uid[i:i+2] for i in range(0, len(uid), 2)
+        )
+
+        card = await db.accesscard.find_unique(
+            where={"uid": pretty_uid},
+            include={"driver": True}
+        )
+
     if not card:
         raise HTTPException(403, "Cartao RFID desconhecido")
 
-    # 2. Verificar estado do cartao
+    # 4. Verificar se o cartao esta ativo
     if card.status != "ACTIVE":
         raise HTTPException(403, "Cartao RFID bloqueado")
 
+      
+
     driver = card.driver
 
-    # 3. Verificar proprietario
+    if not driver:
+        raise HTTPException(403, "Cartao sem proprietario associado")
+
+    # 5. Verificar proprietario
     if driver.status != "ACTIVE":
         raise HTTPException(403, "Proprietario bloqueado")
 
     if driver.role != "OWNER":
         raise HTTPException(403, "Acesso nao autorizado")
 
-    # 4. Procurar veiculo
-    vehicle = await db.vehicle.find_unique(
-        where={"plate": plate}
-    )
-
-    if not vehicle:
-        raise HTTPException(404, "Veiculo nao registado")
-
-    if vehicle.driverId != driver.id:
-        raise HTTPException(
-            403,
-            "Este veiculo nao pertence ao proprietario do cartao"
-        )
-
-    # 5. Verificar ligacao MQTT
+    # 6. Verificar ligacao MQTT
     if not mqtt_client or not mqtt_client.is_connected():
-        raise HTTPException(
-            503,
-            "Sem ligacao ao ESP32/MQTT"
-        )
+        raise HTTPException(503, "Sem ligacao ao ESP32/MQTT")
 
-    # 6. Verificar se o veiculo ja esta dentro
+    # 7. Procurar sessoes ativas deste proprietario
     sessions = await db.parkingsession.find_many(
         where={
             "lotId": LOT_ID,
             "driverId": driver.id,
-            "vehicleId": vehicle.id,
             "status": "ACTIVE"
         },
-        take=1
+        take=2
     )
-
     # ------------------------------------------------
     # SAIDA DO VEICULO
     # ------------------------------------------------
 
     if sessions:
 
+        if len(sessions) > 1:
+            raise HTTPException(
+                409,
+                "Existem varias sessoes ativas para este proprietario"
+            )
+
         session = sessions[0]
+
+        vehicle = await db.vehicle.find_unique(
+            where={"id": session.vehicleId}
+        )
+
+        if not vehicle:
+            raise HTTPException(404, "Veiculo da sessao nao encontrado")
 
         await db.parkingsession.update(
             where={"id": session.id},
@@ -955,7 +1052,7 @@ async def rfid_scan(body: RFIDScan):
             data={
                 "lotId": LOT_ID,
                 "type": "RFID_EXIT",
-                "detail": f"Saida autorizada: {plate}",
+                "detail": f"Saida autorizada: {vehicle.plate}",
                 "driverId": driver.id,
                 "vehicleId": vehicle.id,
                 "accessMethod": "RFID"
@@ -975,7 +1072,28 @@ async def rfid_scan(body: RFIDScan):
     # ENTRADA DO VEICULO
     # ------------------------------------------------
 
-    # Verificar vagas livres
+    # 7. Procurar viaturas do proprietario
+    vehicles = await db.vehicle.find_many(
+        where={
+            "driverId": driver.id
+        }
+    )
+
+    if not vehicles:
+        raise HTTPException(
+            403,
+            "Este proprietario nao tem viaturas registadas"
+        )
+
+    if len(vehicles) > 1:
+        raise HTTPException(
+            409,
+            "Este proprietario tem varias viaturas. E necessario identificar a viatura."
+        )
+
+    vehicle = vehicles[0]
+
+    # 8. Verificar vagas livres
     free_spots = await db.parkingspot.find_many(
         where={
             "lotId": LOT_ID,
@@ -990,7 +1108,7 @@ async def rfid_scan(body: RFIDScan):
             "Parque cheio ou estado das vagas indisponivel"
         )
 
-    # Criar sessao de estacionamento
+    # 9. Criar sessao
     session = await db.parkingsession.create(
         data={
             "lotId": LOT_ID,
@@ -1002,18 +1120,19 @@ async def rfid_scan(body: RFIDScan):
         }
     )
 
-    # Abrir cancela
+    # 10. Abrir cancela
     mqtt_client.publish(
         f"{BASE}/cmd",
         "OPEN",
         qos=1
     )
 
+    # 11. Registar evento
     await db.parkingevent.create(
         data={
             "lotId": LOT_ID,
             "type": "RFID_ENTRY",
-            "detail": f"Entrada autorizada: {plate}",
+            "detail": f"Entrada autorizada: {vehicle.plate}",
             "driverId": driver.id,
             "vehicleId": vehicle.id,
             "accessMethod": "RFID"

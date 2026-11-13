@@ -48,3 +48,6 @@ no `sketch.ino` e em `MQTT_BASE` (variavel de ambiente).
 ## Mudar para SQL Server / PostgreSQL
 Altera o bloco `datasource` em `prisma/schema.prisma` (`provider` e `url = env("DATABASE_URL")`),
 define `DATABASE_URL` e repete `prisma db push`.
+
+
+py -m uvicorn app.main:app --reload
